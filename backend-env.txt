@@ -1,0 +1,4 @@
+env
+MONGO_URL="mongodb://localhost:27017"
+DB_NAME="test_database"
+EMERGENT_LLM_KEY=sk-emergent-22925Ef70EaA6241f9

@@ -1,0 +1,170 @@
+python
+from fastapi import FastAPI, APIRouter, HTTPException
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import json
+import logging
+import re
+import uuid
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime, timezone
+
+from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+
+class ScanRequest(BaseModel):
+    image_base64: str
+    mime_type: Optional[str] = "image/jpeg"
+
+
+class ScanResult(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    category: str
+    severity: str  # low | medium | high | critical
+    co2_per_day_kg: float
+    pollutants: List[str]
+    measures: List[str]
+    summary: str
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+SYSTEM_PROMPT = """You are EcoVision, an environmental analyst that classifies pollution sources from a single image.
+
+Look at the image and identify the dominant subject. Pick exactly ONE category from this list:
+- vehicle (cars, trucks, motorbikes, traffic) -> CO2, NOx, PM2.5
+- factory (industrial buildings, smokestacks) -> SO2, heavy metals, CO2
+- fire_smoke (fire, smoke, burning) -> black carbon, VOCs, CO
+- electronics (phones, computers, e-waste piles) -> e-waste, heavy metals
+- food_livestock (meat, cattle, dairy, farms) -> methane, nitrous oxide
+- plastic (plastic waste, bottles, bags) -> microplastics, dioxins
+- construction (cement, demolition, debris) -> dust, silica
+- nature (trees, forest, plants, ocean) -> carbon absorber (positive)
+- other (anything else)
+
+Reply with STRICT JSON only, no prose, no markdown. Schema:
+{
+  "category": "vehicle|factory|fire_smoke|electronics|food_livestock|plastic|construction|nature|other",
+  "severity": "low|medium|high|critical",
+  "co2_per_day_kg": <number, can be 0 or negative for nature>,
+  "pollutants": ["..."],
+  "measures": ["...", "...", "...", "...", "..."],
+  "summary": "one short sentence describing what was detected"
+}
+
+Rules:
+- Always exactly 5 measures, each <= 90 chars, actionable & specific.
+- For nature, severity=low, co2_per_day_kg negative (carbon absorbed).
+- For fire_smoke or factory smokestacks, severity is usually high or critical.
+"""
+
+
+def _safe_parse_json(text: str) -> dict:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+@api_router.get("/")
+async def root():
+    return {"message": "EcoManage API"}
+
+
+@api_router.post("/scan-pollution", response_model=ScanResult)
+async def scan_pollution(req: ScanRequest):
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="LLM key not configured")
+    if not req.image_base64:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"ecomanage-{uuid.uuid4()}",
+            system_message=SYSTEM_PROMPT,
+        ).with_model("gemini", "gemini-2.5-flash")
+
+        image = ImageContent(image_base64=req.image_base64)
+        msg = UserMessage(
+            text="Analyze this image and respond with the JSON schema only.",
+            file_contents=[image],
+        )
+        raw = await chat.send_message(msg)
+        data = _safe_parse_json(str(raw))
+
+        measures = data.get("measures") or []
+        if len(measures) < 5:
+            measures = (measures + [
+                "Reduce daily energy consumption",
+                "Switch to renewable energy sources",
+                "Recycle and reuse materials",
+                "Use public transport or carpool",
+                "Plant trees and support reforestation",
+            ])[:5]
+        else:
+            measures = measures[:5]
+
+        result = ScanResult(
+            category=str(data.get("category", "other")),
+            severity=str(data.get("severity", "medium")).lower(),
+            co2_per_day_kg=float(data.get("co2_per_day_kg", 0)),
+            pollutants=[str(p) for p in (data.get("pollutants") or [])][:8],
+            measures=[str(m) for m in measures],
+            summary=str(data.get("summary", "")),
+        )
+
+        await db.scans.insert_one(result.model_dump())
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("scan_pollution failed")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {e}")
+
+
+@api_router.get("/scans", response_model=List[ScanResult])
+async def list_scans():
+    cursor = db.scans.find({}, {"_id": 0}).sort("timestamp", -1).limit(50)
+    docs = await cursor.to_list(50)
+    return [ScanResult(**d) for d in docs]
+
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()

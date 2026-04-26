@@ -1,0 +1,1109 @@
+Here's the complete `/app/frontend/app/index.tsx` — every single line:
+
+```tsx
+import React, { useMemo, useState, useEffect } from "react";
+import {
+  Text,
+  View,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+  Image,
+  ActivityIndicator,
+  Modal,
+  Platform,
+  Alert,
+  Pressable,
+} from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { StatusBar } from "expo-status-bar";
+import * as ImagePicker from "expo-image-picker";
+import Slider from "@react-native-community/slider";
+import {
+  Lightbulb,
+  Snowflake,
+  Refrigerator,
+  Tv,
+  Monitor,
+  WashingMachine,
+  Microwave,
+  Wifi,
+  Camera,
+  ImageIcon,
+  Sun,
+  Leaf,
+  Zap,
+  AlertTriangle,
+  CheckCircle2,
+  X,
+  Sparkles,
+} from "lucide-react-native";
+
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "";
+const API = `${BACKEND_URL}/api`;
+
+const COLORS = {
+  bg: "#F9F8F6",
+  surface: "#FFFFFF",
+  primary: "#1B4332",
+  secondary: "#52796F",
+  accent: "#D8F3DC",
+  textPrimary: "#081C15",
+  textSecondary: "#40916C",
+  textMuted: "#6B7B73",
+  border: "#E5E5E0",
+  severity: {
+    low: "#52796F",
+    medium: "#E9C46A",
+    high: "#F4A261",
+    critical: "#E07A5F",
+  } as Record<string, string>,
+};
+
+type Appliance = {
+  id: string;
+  label: string;
+  watts: number;
+  Icon: any;
+};
+
+const APPLIANCES: Appliance[] = [
+  { id: "lights", label: "Lights", watts: 60, Icon: Lightbulb },
+  { id: "ac", label: "Air Conditioner", watts: 1500, Icon: Snowflake },
+  { id: "fridge", label: "Refrigerator", watts: 200, Icon: Refrigerator },
+  { id: "tv", label: "TV", watts: 120, Icon: Tv },
+  { id: "computer", label: "Computer", watts: 250, Icon: Monitor },
+  { id: "washer", label: "Washer", watts: 500, Icon: WashingMachine },
+  { id: "microwave", label: "Microwave", watts: 1100, Icon: Microwave },
+  { id: "router", label: "Wi-Fi Router", watts: 15, Icon: Wifi },
+];
+
+const WEEK_DATA = [
+  { day: "M", kwh: 8.4 },
+  { day: "T", kwh: 9.7 },
+  { day: "W", kwh: 7.2 },
+  { day: "T", kwh: 11.1 },
+  { day: "F", kwh: 10.3 },
+  { day: "S", kwh: 6.5 },
+  { day: "S", kwh: 5.9 },
+];
+
+type ScanResult = {
+  id: string;
+  category: string;
+  severity: string;
+  co2_per_day_kg: number;
+  pollutants: string[];
+  measures: string[];
+  summary: string;
+  timestamp: string;
+};
+
+export default function Index() {
+  const insets = useSafeAreaInsets();
+  const [active, setActive] = useState<Record<string, boolean>>({
+    lights: true,
+    fridge: true,
+    router: true,
+  });
+  const [solarKw, setSolarKw] = useState(2);
+  const [scanning, setScanning] = useState(false);
+  const [scanImage, setScanImage] = useState<string | null>(null);
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [resultOpen, setResultOpen] = useState(false);
+
+  const totalWatts = useMemo(
+    () =>
+      APPLIANCES.reduce(
+        (sum, a) => sum + (active[a.id] ? a.watts : 0),
+        0
+      ),
+    [active]
+  );
+  const drawKw = totalWatts / 1000;
+  const dailyKwh = drawKw * 24;
+  // Solar produces ~5 sun-hours/day at given kW capacity
+  const solarKwhPerDay = solarKw * 5;
+  const netKwh = Math.max(0, dailyKwh - solarKwhPerDay);
+  const offsetPct =
+    dailyKwh > 0 ? Math.min(100, (solarKwhPerDay / dailyKwh) * 100) : 0;
+
+  const maxKwh = Math.max(...WEEK_DATA.map((d) => d.kwh));
+
+  const toggle = (id: string) =>
+    setActive((p) => ({ ...p, [id]: !p[id] }));
+
+  const pickImage = async (useCamera: boolean) => {
+    setErrorMsg(null);
+    try {
+      let res;
+      if (useCamera) {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Permission needed", "Camera access is required.");
+          return;
+        }
+        res = await ImagePicker.launchCameraAsync({
+          base64: true,
+          quality: 0.6,
+          mediaTypes: "images" as any,
+        });
+      } else {
+        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Permission needed", "Photo library access is required.");
+          return;
+        }
+        res = await ImagePicker.launchImageLibraryAsync({
+          base64: true,
+          quality: 0.6,
+          mediaTypes: "images" as any,
+        });
+      }
+      if (res.canceled || !res.assets || res.assets.length === 0) return;
+      const asset = res.assets[0];
+      let base64 = asset.base64 || "";
+      if (!base64 && asset.uri && Platform.OS === "web") {
+        const r = await fetch(asset.uri);
+        const blob = await r.blob();
+        base64 = await blobToBase64(blob);
+      }
+      if (!base64) {
+        setErrorMsg("Could not read image data.");
+        return;
+      }
+      setScanImage(`data:image/jpeg;base64,${base64}`);
+      await runScan(base64);
+    } catch (e: any) {
+      setErrorMsg(e?.message || "Failed to pick image");
+    }
+  };
+
+  const runScan = async (base64: string) => {
+    setScanning(true);
+    setScanResult(null);
+    setResultOpen(true);
+    try {
+      const r = await fetch(`${API}/scan-pollution`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image_base64: base64,
+          mime_type: "image/jpeg",
+        }),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(t || `HTTP ${r.status}`);
+      }
+      const data: ScanResult = await r.json();
+      setScanResult(data);
+    } catch (e: any) {
+      setErrorMsg(e?.message || "Scan failed");
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: COLORS.bg }}>
+      <StatusBar style="light" />
+      <ScrollView
+        contentContainerStyle={{
+          paddingBottom: 60 + insets.bottom,
+        }}
+        showsVerticalScrollIndicator={false}
+        testID="ecomanage-scroll"
+      >
+        {/* HERO */}
+        <View style={styles.hero} testID="hero-section">
+          <Image
+            source={{
+              uri: "https://images.pexels.com/photos/35197245/pexels-photo-35197245.jpeg",
+            }}
+            style={StyleSheet.absoluteFill as any}
+            resizeMode="cover"
+          />
+          <View style={styles.heroOverlay} />
+          <View
+            style={[
+              styles.heroContent,
+              { paddingTop: insets.top + 20 },
+            ]}
+          >
+            <View style={styles.brandRow}>
+              <Leaf size={18} color="#D8F3DC" />
+              <Text style={styles.brand}>EcoManage</Text>
+            </View>
+            <Text style={styles.heroTitle}>
+              Live energy & pollution intelligence
+            </Text>
+            <Text style={styles.heroSub}>
+              Track your home draw, simulate solar offset, and scan the world
+              for pollution sources.
+            </Text>
+
+            <View style={styles.heroStats}>
+              <View style={styles.heroStat}>
+                <Text style={styles.heroStatValue}>
+                  {drawKw.toFixed(2)}
+                  <Text style={styles.heroStatUnit}> kW</Text>
+                </Text>
+                <Text style={styles.heroStatLabel}>Live draw</Text>
+              </View>
+              <View style={styles.heroDivider} />
+              <View style={styles.heroStat}>
+                <Text style={styles.heroStatValue}>
+                  {netKwh.toFixed(1)}
+                  <Text style={styles.heroStatUnit}> kWh</Text>
+                </Text>
+                <Text style={styles.heroStatLabel}>Net / day</Text>
+              </View>
+              <View style={styles.heroDivider} />
+              <View style={styles.heroStat}>
+                <Text style={styles.heroStatValue}>
+                  {Math.round(offsetPct)}
+                  <Text style={styles.heroStatUnit}>%</Text>
+                </Text>
+                <Text style={styles.heroStatLabel}>Solar offset</Text>
+              </View>
+            </View>
+          </View>
+        </View>
+
+        {/* APPLIANCES */}
+        <View style={styles.section} testID="appliances-section">
+          <View style={styles.sectionHeader}>
+            <Text style={styles.eyebrow}>Real-time draw</Text>
+            <Text style={styles.h2}>Appliances</Text>
+            <Text style={styles.muted}>
+              Tap to toggle. Watt totals update instantly.
+            </Text>
+          </View>
+
+          <View style={styles.grid}>
+            {APPLIANCES.map((a) => {
+              const on = !!active[a.id];
+              const Icon = a.Icon;
+              return (
+                <Pressable
+                  key={a.id}
+                  testID={`toggle-${a.id}`}
+                  onPress={() => toggle(a.id)}
+                  style={[
+                    styles.appCard,
+                    on ? styles.appCardOn : styles.appCardOff,
+                  ]}
+                >
+                  <View
+                    style={[
+                      styles.appIconWrap,
+                      {
+                        backgroundColor: on
+                          ? "rgba(255,255,255,0.12)"
+                          : COLORS.accent,
+                      },
+                    ]}
+                  >
+                    <Icon
+                      size={22}
+                      color={on ? "#FFFFFF" : COLORS.primary}
+                    />
+                  </View>
+                  <Text
+                    style={[
+                      styles.appLabel,
+                      { color: on ? "#FFFFFF" : COLORS.textPrimary },
+                    ]}
+                  >
+                    {a.label}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.appWatts,
+                      { color: on ? "#D8F3DC" : COLORS.textMuted },
+                    ]}
+                  >
+                    {a.watts} W
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <View style={styles.totalCard} testID="total-card">
+            <View>
+              <Text style={styles.eyebrowDark}>Current total</Text>
+              <Text style={styles.totalKw}>
+                {drawKw.toFixed(2)}
+                <Text style={styles.totalKwUnit}> kW</Text>
+              </Text>
+              <Text style={styles.muted}>
+                ≈ {dailyKwh.toFixed(1)} kWh per day
+              </Text>
+            </View>
+            <View style={styles.boltWrap}>
+              <Zap size={28} color={COLORS.primary} />
+            </View>
+          </View>
+        </View>
+
+        {/* SOLAR */}
+        <View style={styles.section} testID="solar-section">
+          <View style={styles.sectionHeader}>
+            <Text style={styles.eyebrow}>Renewable simulator</Text>
+            <Text style={styles.h2}>Solar offset</Text>
+            <Text style={styles.muted}>
+              Estimated 5 peak sun-hours per day.
+            </Text>
+          </View>
+
+          <View style={styles.solarCard}>
+            <View style={styles.solarTop}>
+              <View style={styles.solarIconWrap}>
+                <Sun size={24} color={COLORS.primary} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.solarKw} testID="solar-kw-value">
+                  {solarKw.toFixed(1)} kW
+                </Text>
+                <Text style={styles.muted}>Installed capacity</Text>
+              </View>
+              <View style={styles.solarBadge}>
+                <Text style={styles.solarBadgeText}>
+                  {solarKwhPerDay.toFixed(1)} kWh/day
+                </Text>
+              </View>
+            </View>
+
+            <Slider
+              testID="solar-slider"
+              style={{ width: "100%", height: 40 }}
+              minimumValue={0}
+              maximumValue={15}
+              step={0.5}
+              value={solarKw}
+              onValueChange={setSolarKw}
+              minimumTrackTintColor={COLORS.primary}
+              maximumTrackTintColor="#B7E4C7"
+              thumbTintColor={COLORS.primary}
+            />
+
+            <View style={styles.progressTrack}>
+              <View
+                style={[
+                  styles.progressFill,
+                  { width: `${offsetPct}%` },
+                ]}
+              />
+            </View>
+            <View style={styles.progressLabels}>
+              <Text style={styles.muted}>Offset</Text>
+              <Text style={styles.progressPct}>
+                {offsetPct.toFixed(0)}%
+              </Text>
+            </View>
+          </View>
+        </View>
+
+        {/* WEEKLY CHART */}
+        <View style={styles.section} testID="weekly-section">
+          <View style={styles.sectionHeader}>
+            <Text style={styles.eyebrow}>This week</Text>
+            <Text style={styles.h2}>kWh consumption</Text>
+          </View>
+
+          <View style={styles.chartCard}>
+            <View style={styles.chartRow}>
+              {WEEK_DATA.map((d, i) => {
+                const h = (d.kwh / maxKwh) * 140;
+                return (
+                  <View
+                    key={i}
+                    style={styles.barCol}
+                    testID={`bar-${i}`}
+                  >
+                    <Text style={styles.barValue}>{d.kwh}</Text>
+                    <View
+                      style={[
+                        styles.bar,
+                        {
+                          height: h,
+                          backgroundColor:
+                            d.kwh === maxKwh ? COLORS.primary : COLORS.secondary,
+                        },
+                      ]}
+                    />
+                    <Text style={styles.barLabel}>{d.day}</Text>
+                  </View>
+                );
+              })}
+            </View>
+            <View style={styles.chartFooter}>
+              <Text style={styles.muted}>
+                Avg{" "}
+                {(
+                  WEEK_DATA.reduce((s, d) => s + d.kwh, 0) / WEEK_DATA.length
+                ).toFixed(1)}{" "}
+                kWh
+              </Text>
+              <Text style={styles.muted}>
+                Peak {maxKwh.toFixed(1)} kWh
+              </Text>
+            </View>
+          </View>
+        </View>
+
+        {/* SCANNER */}
+        <View style={styles.section} testID="scanner-section">
+          <View style={styles.sectionHeader}>
+            <Text style={styles.eyebrow}>AI Vision</Text>
+            <Text style={styles.h2}>Pollution scanner</Text>
+            <Text style={styles.muted}>
+              Snap or pick a photo. Detect sources, severity & remedies.
+            </Text>
+          </View>
+
+          <View style={styles.scanTrigger} testID="scan-trigger">
+            <View style={styles.scanIconBig}>
+              <Sparkles size={28} color={COLORS.primary} />
+            </View>
+            <Text style={styles.scanTitle}>Scan an image</Text>
+            <Text style={[styles.muted, { textAlign: "center" }]}>
+              Vehicles, factories, smoke, plastic, electronics, livestock,
+              construction or nature.
+            </Text>
+
+            <View style={styles.scanBtnRow}>
+              <TouchableOpacity
+                testID="btn-scan-camera"
+                style={[styles.scanBtn, styles.scanBtnPrimary]}
+                onPress={() => pickImage(true)}
+                activeOpacity={0.85}
+              >
+                <Camera size={18} color="#FFFFFF" />
+                <Text style={styles.scanBtnTextLight}>Camera</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                testID="btn-scan-gallery"
+                style={[styles.scanBtn, styles.scanBtnGhost]}
+                onPress={() => pickImage(false)}
+                activeOpacity={0.85}
+              >
+                <ImageIcon size={18} color={COLORS.primary} />
+                <Text style={styles.scanBtnTextDark}>Gallery</Text>
+              </TouchableOpacity>
+            </View>
+
+            {errorMsg ? (
+              <Text style={styles.errorText} testID="scan-error">
+                {errorMsg}
+              </Text>
+            ) : null}
+          </View>
+        </View>
+
+        <Text style={styles.footer}>EcoManage · live · v1.0</Text>
+      </ScrollView>
+
+      {/* RESULT MODAL */}
+      <Modal
+        visible={resultOpen}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setResultOpen(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <SafeAreaView style={styles.modalCard} edges={["bottom"]}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <Text style={styles.h2}>Scan result</Text>
+              <TouchableOpacity
+                testID="btn-close-modal"
+                onPress={() => setResultOpen(false)}
+                style={styles.closeBtn}
+              >
+                <X size={20} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView contentContainerStyle={{ paddingBottom: 24 }}>
+              {scanImage ? (
+                <Image
+                  source={{ uri: scanImage }}
+                  style={styles.previewImg}
+                  resizeMode="cover"
+                />
+              ) : null}
+
+              {scanning ? (
+                <View style={styles.loadingWrap} testID="scan-loading">
+                  <ActivityIndicator size="large" color={COLORS.primary} />
+                  <Text style={styles.muted}>Analyzing image…</Text>
+                </View>
+              ) : null}
+
+              {scanResult ? (
+                <View testID="scan-result">
+                  <View style={styles.resultRow}>
+                    <SeverityBadge severity={scanResult.severity} />
+                    <View style={styles.categoryPill}>
+                      <Text style={styles.categoryPillText}>
+                        {scanResult.category.replace("_", " ")}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <Text style={styles.summaryText}>
+                    {scanResult.summary}
+                  </Text>
+
+                  <View style={styles.co2Card}>
+                    <Text style={styles.eyebrow}>Estimated impact</Text>
+                    <Text style={styles.co2Number}>
+                      {scanResult.co2_per_day_kg >= 0 ? "+" : ""}
+                      {scanResult.co2_per_day_kg.toFixed(1)}
+                      <Text style={styles.co2Unit}> kg CO₂/day</Text>
+                    </Text>
+                    {scanResult.co2_per_day_kg < 0 ? (
+                      <Text style={styles.positiveText}>
+                        Carbon absorber — positive impact
+                      </Text>
+                    ) : null}
+                  </View>
+
+                  <Text style={[styles.eyebrow, { marginTop: 16 }]}>
+                    Pollutants detected
+                  </Text>
+                  <View style={styles.pollutantsRow}>
+                    {scanResult.pollutants.map((p, i) => (
+                      <View key={i} style={styles.chip}>
+                        <Text style={styles.chipText}>{p}</Text>
+                      </View>
+                    ))}
+                  </View>
+
+                  <Text style={[styles.eyebrow, { marginTop: 20 }]}>
+                    Preventive measures
+                  </Text>
+                  {scanResult.measures.map((m, i) => (
+                    <View
+                      key={i}
+                      style={styles.measureRow}
+                      testID={`measure-${i}`}
+                    >
+                      <CheckCircle2
+                        size={18}
+                        color={COLORS.primary}
+                        style={{ marginTop: 2 }}
+                      />
+                      <Text style={styles.measureText}>{m}</Text>
+                    </View>
+                  ))}
+                </View>
+              ) : null}
+
+              {errorMsg && !scanning ? (
+                <View style={styles.errorCard}>
+                  <AlertTriangle size={18} color={COLORS.severity.critical} />
+                  <Text style={styles.errorCardText}>{errorMsg}</Text>
+                </View>
+              ) : null}
+            </ScrollView>
+          </SafeAreaView>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+function SeverityBadge({ severity }: { severity: string }) {
+  const color = COLORS.severity[severity] || COLORS.severity.medium;
+  return (
+    <View
+      style={[styles.sevBadge, { backgroundColor: color }]}
+      testID={`severity-${severity}`}
+    >
+      <Text style={styles.sevBadgeText}>{severity.toUpperCase()}</Text>
+    </View>
+  );
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const r = reader.result as string;
+      const idx = r.indexOf(",");
+      resolve(idx >= 0 ? r.slice(idx + 1) : r);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+const styles = StyleSheet.create({
+  hero: {
+    minHeight: 360,
+    backgroundColor: COLORS.primary,
+    overflow: "hidden",
+  },
+  heroOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(8,28,21,0.55)",
+  },
+  heroContent: {
+    paddingHorizontal: 24,
+    paddingBottom: 32,
+    gap: 12,
+  },
+  brandRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  brand: {
+    color: "#D8F3DC",
+    fontSize: 13,
+    fontWeight: "700",
+    letterSpacing: 2,
+    textTransform: "uppercase",
+  },
+  heroTitle: {
+    color: "#FFFFFF",
+    fontSize: 32,
+    fontWeight: "800",
+    letterSpacing: -1,
+    lineHeight: 38,
+    marginTop: 8,
+  },
+  heroSub: {
+    color: "rgba(255,255,255,0.78)",
+    fontSize: 15,
+    lineHeight: 22,
+    marginBottom: 20,
+  },
+  heroStats: {
+    flexDirection: "row",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderRadius: 20,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  heroStat: { flex: 1 },
+  heroStatValue: {
+    color: "#FFFFFF",
+    fontSize: 22,
+    fontWeight: "800",
+    letterSpacing: -0.5,
+  },
+  heroStatUnit: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "rgba(255,255,255,0.7)",
+  },
+  heroStatLabel: {
+    color: "rgba(255,255,255,0.65)",
+    fontSize: 11,
+    fontWeight: "600",
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    marginTop: 4,
+  },
+  heroDivider: {
+    width: 1,
+    backgroundColor: "rgba(255,255,255,0.15)",
+    marginHorizontal: 8,
+  },
+
+  section: {
+    paddingHorizontal: 24,
+    paddingTop: 36,
+    gap: 20,
+  },
+  sectionHeader: { gap: 4 },
+  eyebrow: {
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 2,
+    textTransform: "uppercase",
+    color: COLORS.textSecondary,
+  },
+  eyebrowDark: {
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 2,
+    textTransform: "uppercase",
+    color: COLORS.textMuted,
+  },
+  h2: {
+    fontSize: 26,
+    fontWeight: "800",
+    letterSpacing: -0.5,
+    color: COLORS.textPrimary,
+  },
+  muted: { fontSize: 14, color: COLORS.textMuted, lineHeight: 20 },
+
+  grid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+  },
+  appCard: {
+    width: "31.5%",
+    flexGrow: 1,
+    minWidth: 100,
+    borderRadius: 18,
+    padding: 14,
+    gap: 10,
+    borderWidth: 1,
+  },
+  appCardOff: {
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.border,
+  },
+  appCardOn: {
+    backgroundColor: COLORS.primary,
+    borderColor: COLORS.primary,
+  },
+  appIconWrap: {
+    width: 38,
+    height: 38,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  appLabel: { fontSize: 14, fontWeight: "700" },
+  appWatts: { fontSize: 12, fontWeight: "600" },
+
+  totalCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: COLORS.surface,
+    borderRadius: 24,
+    padding: 24,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  totalKw: {
+    fontSize: 40,
+    fontWeight: "800",
+    color: COLORS.textPrimary,
+    letterSpacing: -1,
+    marginVertical: 4,
+  },
+  totalKwUnit: { fontSize: 16, fontWeight: "700", color: COLORS.textSecondary },
+  boltWrap: {
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    backgroundColor: COLORS.accent,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  solarCard: {
+    backgroundColor: COLORS.accent,
+    borderRadius: 24,
+    padding: 24,
+    gap: 16,
+  },
+  solarTop: { flexDirection: "row", alignItems: "center", gap: 14 },
+  solarIconWrap: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: "rgba(255,255,255,0.7)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  solarKw: {
+    fontSize: 26,
+    fontWeight: "800",
+    color: COLORS.textPrimary,
+    letterSpacing: -0.5,
+  },
+  solarBadge: {
+    backgroundColor: COLORS.primary,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+  },
+  solarBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  progressTrack: {
+    height: 10,
+    backgroundColor: "rgba(255,255,255,0.7)",
+    borderRadius: 999,
+    overflow: "hidden",
+  },
+  progressFill: {
+    height: "100%",
+    backgroundColor: COLORS.primary,
+    borderRadius: 999,
+  },
+  progressLabels: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  progressPct: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: COLORS.primary,
+  },
+
+  chartCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 24,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  chartRow: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
+    height: 180,
+    paddingHorizontal: 4,
+  },
+  barCol: { alignItems: "center", flex: 1, gap: 6 },
+  bar: {
+    width: 22,
+    borderTopLeftRadius: 6,
+    borderTopRightRadius: 6,
+  },
+  barValue: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: COLORS.textMuted,
+  },
+  barLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.textPrimary,
+    marginTop: 4,
+  },
+  chartFooter: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
+  },
+
+  scanTrigger: {
+    backgroundColor: COLORS.surface,
+    borderStyle: "dashed",
+    borderWidth: 2,
+    borderColor: COLORS.secondary,
+    borderRadius: 24,
+    padding: 28,
+    alignItems: "center",
+    gap: 12,
+  },
+  scanIconBig: {
+    width: 64,
+    height: 64,
+    borderRadius: 20,
+    backgroundColor: COLORS.accent,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 4,
+  },
+  scanTitle: {
+    fontSize: 20,
+    fontWeight: "800",
+    color: COLORS.textPrimary,
+    letterSpacing: -0.5,
+  },
+  scanBtnRow: { flexDirection: "row", gap: 12, marginTop: 12 },
+  scanBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    borderRadius: 14,
+    minHeight: 48,
+  },
+  scanBtnPrimary: { backgroundColor: COLORS.primary },
+  scanBtnGhost: {
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+    backgroundColor: "transparent",
+  },
+  scanBtnTextLight: { color: "#FFFFFF", fontWeight: "700", fontSize: 15 },
+  scanBtnTextDark: { color: COLORS.primary, fontWeight: "700", fontSize: 15 },
+
+  errorText: {
+    color: COLORS.severity.critical,
+    fontSize: 13,
+    fontWeight: "600",
+    textAlign: "center",
+    marginTop: 8,
+  },
+
+  footer: {
+    textAlign: "center",
+    color: COLORS.textMuted,
+    fontSize: 12,
+    fontWeight: "600",
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    marginTop: 40,
+  },
+
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(8,28,21,0.55)",
+    justifyContent: "flex-end",
+  },
+  modalCard: {
+    backgroundColor: COLORS.bg,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    maxHeight: "90%",
+  },
+  modalHandle: {
+    width: 40,
+    height: 5,
+    borderRadius: 5,
+    backgroundColor: COLORS.border,
+    alignSelf: "center",
+    marginBottom: 8,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 16,
+  },
+  closeBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  previewImg: {
+    width: "100%",
+    height: 200,
+    borderRadius: 18,
+    marginBottom: 16,
+    backgroundColor: COLORS.border,
+  },
+  loadingWrap: {
+    paddingVertical: 40,
+    alignItems: "center",
+    gap: 16,
+  },
+  resultRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 12,
+  },
+  sevBadge: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  sevBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 1,
+  },
+  categoryPill: {
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  categoryPillText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.textPrimary,
+    textTransform: "capitalize",
+  },
+  summaryText: {
+    fontSize: 16,
+    color: COLORS.textPrimary,
+    lineHeight: 24,
+    marginBottom: 16,
+  },
+  co2Card: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 18,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    gap: 4,
+  },
+  co2Number: {
+    fontSize: 32,
+    fontWeight: "800",
+    color: COLORS.textPrimary,
+    letterSpacing: -1,
+  },
+  co2Unit: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: COLORS.textSecondary,
+  },
+  positiveText: {
+    color: COLORS.textSecondary,
+    fontSize: 13,
+    fontWeight: "700",
+    marginTop: 4,
+  },
+  pollutantsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 8,
+  },
+  chip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: COLORS.accent,
+    borderRadius: 999,
+  },
+  chipText: { fontSize: 12, fontWeight: "700", color: COLORS.primary },
+  measureRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
+    paddingVertical: 8,
+  },
+  measureText: { flex: 1, color: COLORS.textPrimary, fontSize: 14, lineHeight: 20 },
+
+  errorCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: "#FFF1ED",
+    borderRadius: 14,
+    padding: 14,
+    marginTop: 12,
+  },
+  errorCardText: { flex: 1, color: COLORS.severity.critical, fontWeight: "600" },
+});
+```
+
